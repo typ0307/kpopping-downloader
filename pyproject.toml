@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "beautifulsoup4>=4.15.0",
+    "cloudscraper>=1.2.71",
     "pyside6>=6.11.1",
     "requests>=2.34.2",
 ]

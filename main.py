@@ -1,9 +1,11 @@
 import os
+import random
 import re
 import sys
+import time
 from urllib.parse import unquote
 
-import requests
+import cloudscraper
 from bs4 import BeautifulSoup
 from PySide6.QtCore import QSize, Qt, QThread, Signal
 from PySide6.QtGui import QIcon, QImage, QPixmap
@@ -24,15 +26,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-# 봇 차단(Anti-Bot) 우회를 위한 헤더 설정
+# 봇 탐지 우회를 위한 크롬 브라우저 위장 스크래퍼
+scraper = cloudscraper.create_scraper(
+    browser={"browser": "chrome", "platform": "windows", "desktop": True}
+)
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Referer": "https://kpopping.com/",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
 }
 
 
 class FetchThread(QThread):
-    """HTML을 파싱하여 제목과 고화질 이미지 URL 리스트를 가져오는 스레드"""
+    """HTML 파싱 및 고화질 이미지 URL 리스트 추출"""
 
     finished_signal = Signal(str, list)
     error_signal = Signal(str)
@@ -43,109 +49,118 @@ class FetchThread(QThread):
 
     def run(self):
         try:
-            res = requests.get(self.url, headers=HEADERS, timeout=10)
+            res = scraper.get(self.url, headers=HEADERS, timeout=10)
             res.raise_for_status()
             soup = BeautifulSoup(res.text, "html.parser")
 
-            # 제목 추출 및 폴더명 안전 처리 (특수문자 제거)
             title_tag = soup.find("h1")
             title = title_tag.text.strip() if title_tag else "Karina_Downloaded"
             title = re.sub(r'[\\/*?:"<>|]', "", title)
 
             img_urls = []
 
-            # 메인 갤러리가 있는 <article> 태그만 추출
             main_article = soup.find("article")
             target_soup = main_article if main_article else soup
 
-            # 불필요한 추천 앨범 등의 <section> 태그 제거
             for section in target_soup.find_all("section"):
                 section.decompose()
 
-            # 정제된 영역 안에서 이미지 추출
             for img in target_soup.find_all("img"):
                 src = img.get("src", "")
 
-                # 원본 URL이 url 파라미터에 인코딩되어 숨겨져 있는 경우
                 if "url=" in src and "cdn.kpopping.com" in src:
                     match = re.search(r"url=([^&]+)", src)
                     if match:
                         decoded_url = unquote(match.group(1))
                         if decoded_url not in img_urls:
                             img_urls.append(decoded_url)
-                # 원본 URL이 직접 노출된 경우
                 elif "cdn.kpopping.com/kpics" in src and "url=" not in src:
                     if src not in img_urls:
                         img_urls.append(src)
 
             if not img_urls:
-                raise ValueError("이미지를 찾을 수 없습니다. 주소를 다시 확인해주세요.")
+                raise ValueError("이미지를 찾을 수 없습니다. 주소를 확인해주세요.")
 
             self.finished_signal.emit(title, img_urls)
         except Exception as e:
-            self.error_signal.emit(str(e))
+            self.error_signal.emit(f"페이지 접근 실패:\n{e!s}")
 
 
 class ThumbnailLoaderThread(QThread):
-    """리스트 위젯에 섬네일을 비동기로 로드하는 스레드"""
+    """리스트 위젯용 썸네일 비동기 다운로드"""
 
     thumb_loaded = Signal(int, QPixmap, str)
 
     def __init__(self, urls):
         super().__init__()
         self.urls = urls
+        self.is_cancelled = False
 
     def run(self):
         for idx, url in enumerate(self.urls):
+            if self.is_cancelled:
+                break
             try:
-                # 빠른 로딩을 위해 Next.js 최적화 썸네일 API 활용 (가로 256px 기준)
+                time.sleep(random.uniform(0.1, 0.3))
                 encoded_url = url.replace(":", "%3A").replace("/", "%2F")
                 thumb_url = (
                     f"https://kpopping.com/_next/image?url={encoded_url}&w=256&q=75"
                 )
 
-                res = requests.get(thumb_url, headers=HEADERS, timeout=5)
+                res = scraper.get(thumb_url, headers=HEADERS, timeout=5)
                 if res.status_code == 200:
                     img = QImage()
                     img.loadFromData(res.content)
-                    pixmap = QPixmap.fromImage(img)
-                    self.thumb_loaded.emit(idx, pixmap, url)
+                    self.thumb_loaded.emit(idx, QPixmap.fromImage(img), url)
             except Exception:
-                pass  # 섬네일 로드 실패 시 무시
+                continue
+
+    def cancel(self):
+        self.is_cancelled = True
 
 
 class DownloadThread(QThread):
-    """원본 고화질 이미지를 폴더에 전체 저장하는 스레드"""
+    """원본 고화질 이미지 전체 저장 (Rate Limit 우회 및 중단 기능 포함)"""
 
     progress_signal = Signal(int)
-    finished_signal = Signal()
+    finished_signal = Signal(bool)
     error_signal = Signal(str)
 
     def __init__(self, urls, save_dir):
         super().__init__()
         self.urls = urls
         self.save_dir = save_dir
+        self.is_cancelled = False
 
     def run(self):
         try:
             os.makedirs(self.save_dir, exist_ok=True)
             total = len(self.urls)
+
             for idx, url in enumerate(self.urls, 1):
-                res = requests.get(url, headers=HEADERS, timeout=15)
+                if self.is_cancelled:
+                    self.finished_signal.emit(False)
+                    return
+
+                time.sleep(random.uniform(0.5, 1.5))
+
+                res = scraper.get(url, headers=HEADERS, timeout=15)
                 res.raise_for_status()
 
-                ext = url.split(".")[-1]
-                if len(ext) > 4:
-                    ext = "jpg"
+                original_filename = url.split("/")[-1].split("?")[0]
+                file_path = os.path.join(self.save_dir, original_filename)
 
-                file_path = os.path.join(self.save_dir, f"{idx:03d}.{ext}")
                 with open(file_path, "wb") as f:
                     f.write(res.content)
 
                 self.progress_signal.emit(int((idx / total) * 100))
-            self.finished_signal.emit()
+
+            self.finished_signal.emit(True)
         except Exception as e:
-            self.error_signal.emit(str(e))
+            self.error_signal.emit(f"다운로드 중 오류:\n{e!s}")
+
+    def cancel(self):
+        self.is_cancelled = True
 
 
 class MainWindow(QMainWindow):
@@ -155,7 +170,12 @@ class MainWindow(QMainWindow):
         self.resize(1200, 900)
         self.urls = []
         self.current_title = ""
-        self.current_image_url = ""  # 현재 보고 있는 사진의 URL
+        self.current_image_url = ""
+
+        self.fetch_thread = None
+        self.thumb_thread = None
+        self.download_thread = None
+
         self.setup_ui()
 
     def setup_ui(self):
@@ -163,7 +183,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
-        # 상단: URL 입력
+        # 상단 (입력부)
         url_layout = QHBoxLayout()
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("kpopping.com 주소를 입력하세요...")
@@ -173,10 +193,9 @@ class MainWindow(QMainWindow):
         url_layout.addWidget(self.btn_load)
         main_layout.addLayout(url_layout)
 
-        # 뷰어와 썸네일 크기 조절을 위한 수직 Splitter
+        # 중앙 및 하단 (스플리터 제어)
         splitter = QSplitter(Qt.Vertical)
 
-        # 중앙: 메인 이미지 뷰어
         self.image_viewer = QLabel("주소를 입력하고 불러오기를 클릭하세요")
         self.image_viewer.setAlignment(Qt.AlignCenter)
         self.image_viewer.setStyleSheet(
@@ -184,7 +203,6 @@ class MainWindow(QMainWindow):
         )
         splitter.addWidget(self.image_viewer)
 
-        # 하단: 썸네일 슬라이더
         self.thumbnail_list = QListWidget()
         self.thumbnail_list.setViewMode(QListWidget.IconMode)
         self.thumbnail_list.setIconSize(QSize(120, 120))
@@ -193,11 +211,10 @@ class MainWindow(QMainWindow):
         self.thumbnail_list.itemClicked.connect(self.on_thumbnail_clicked)
         splitter.addWidget(self.thumbnail_list)
 
-        # Splitter 비율 설정 (뷰어 크게, 썸네일 작게)
         splitter.setSizes([700, 150])
         main_layout.addWidget(splitter, stretch=1)
 
-        # 최하단: 저장 경로 및 다운로드 제어부
+        # 최하단 (경로 및 다운로드 제어부)
         save_layout = QHBoxLayout()
         self.path_input = QLineEdit()
         self.path_input.setText(os.path.expanduser("~/Downloads"))
@@ -213,13 +230,18 @@ class MainWindow(QMainWindow):
         self.btn_download_all.clicked.connect(self.download_images)
         self.btn_download_all.setEnabled(False)
 
+        self.btn_stop = QPushButton("다운로드 중지")
+        self.btn_stop.clicked.connect(self.stop_download)
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.setStyleSheet("color: red; font-weight: bold;")
+
         save_layout.addWidget(self.path_input)
         save_layout.addWidget(self.btn_browse)
         save_layout.addWidget(self.btn_download_single)
         save_layout.addWidget(self.btn_download_all)
+        save_layout.addWidget(self.btn_stop)
         main_layout.addLayout(save_layout)
 
-        # 프로그레스 바
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
         main_layout.addWidget(self.progress_bar)
@@ -228,6 +250,10 @@ class MainWindow(QMainWindow):
         url = self.url_input.text().strip()
         if not url:
             return
+
+        # 기존 스레드가 돌고 있다면 중단
+        if self.thumb_thread and self.thumb_thread.isRunning():
+            self.thumb_thread.cancel()
 
         self.btn_load.setEnabled(False)
         self.image_viewer.setText("로딩 중...")
@@ -247,11 +273,9 @@ class MainWindow(QMainWindow):
         self.btn_download_all.setEnabled(True)
         self.btn_download_single.setEnabled(True)
 
-        # 첫 번째 이미지를 뷰어에 로드
         if self.urls:
             self.load_main_image(self.urls[0])
 
-        # 썸네일 비동기 로딩
         self.thumb_thread = ThumbnailLoaderThread(self.urls)
         self.thumb_thread.thumb_loaded.connect(self.add_thumbnail)
         self.thumb_thread.start()
@@ -270,12 +294,10 @@ class MainWindow(QMainWindow):
     def load_main_image(self, url):
         self.current_image_url = url
         try:
-            res = requests.get(url, headers=HEADERS, timeout=5)
+            res = scraper.get(url, headers=HEADERS, timeout=5)
             img = QImage()
             img.loadFromData(res.content)
-            self.current_pixmap = QPixmap.fromImage(
-                img
-            )  # 리사이즈 이벤트를 위해 원본 저장
+            self.current_pixmap = QPixmap.fromImage(img)
 
             scaled_pixmap = self.current_pixmap.scaled(
                 self.image_viewer.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
@@ -298,24 +320,18 @@ class MainWindow(QMainWindow):
         os.makedirs(save_dir, exist_ok=True)
 
         try:
-            idx = self.urls.index(self.current_image_url) + 1
-            ext = self.current_image_url.split(".")[-1]
-            if len(ext) > 4:
-                ext = "jpg"
+            original_filename = self.current_image_url.split("/")[-1].split("?")[0]
+            file_path = os.path.join(save_dir, original_filename)
 
-            file_path = os.path.join(save_dir, f"{idx:03d}.{ext}")
-
-            res = requests.get(self.current_image_url, headers=HEADERS, timeout=10)
+            res = scraper.get(self.current_image_url, headers=HEADERS, timeout=10)
             res.raise_for_status()
 
             with open(file_path, "wb") as f:
                 f.write(res.content)
 
-            QMessageBox.information(
-                self, "성공", f"현재 사진 1장이 저장되었습니다!\n\n경로: {file_path}"
-            )
+            QMessageBox.information(self, "성공", f"저장 완료:\n{file_path}")
         except Exception as e:
-            QMessageBox.critical(self, "오류", f"저장 중 오류가 발생했습니다:\n{e!s}")
+            QMessageBox.critical(self, "오류", f"저장 실패:\n{e!s}")
 
     def download_images(self):
         base_dir = self.path_input.text().strip()
@@ -323,29 +339,47 @@ class MainWindow(QMainWindow):
 
         self.btn_download_all.setEnabled(False)
         self.btn_download_single.setEnabled(False)
+        self.btn_stop.setEnabled(True)
         self.progress_bar.setValue(0)
 
         self.download_thread = DownloadThread(self.urls, save_dir)
         self.download_thread.progress_signal.connect(self.progress_bar.setValue)
         self.download_thread.finished_signal.connect(self.on_download_finished)
-        self.download_thread.error_signal.connect(self.on_error)
+        self.download_thread.error_signal.connect(self.on_download_error)
         self.download_thread.start()
 
-    def on_download_finished(self):
+    def stop_download(self):
+        if self.download_thread and self.download_thread.isRunning():
+            self.download_thread.cancel()
+            self.btn_stop.setEnabled(False)
+
+    def on_download_finished(self, completed):
         self.btn_download_all.setEnabled(True)
         self.btn_download_single.setEnabled(True)
-        QMessageBox.information(
-            self, "완료", f"[{self.current_title}] 앨범 전체 다운로드가 완료되었습니다!"
-        )
+        self.btn_stop.setEnabled(False)
+
+        if completed:
+            QMessageBox.information(
+                self, "완료", f"[{self.current_title}] 전체 다운로드 완료!"
+            )
+        else:
+            QMessageBox.warning(
+                self, "중단", "다운로드가 사용자에 의해 중단되었습니다."
+            )
 
     def on_error(self, err_msg):
         self.btn_load.setEnabled(True)
         self.btn_download_all.setEnabled(bool(self.urls))
         self.btn_download_single.setEnabled(bool(self.urls))
-        QMessageBox.critical(self, "오류", f"오류가 발생했습니다:\n{err_msg}")
+        QMessageBox.critical(self, "오류", err_msg)
+
+    def on_download_error(self, err_msg):
+        self.btn_download_all.setEnabled(True)
+        self.btn_download_single.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        QMessageBox.critical(self, "오류", err_msg)
 
     def resizeEvent(self, event):
-        # 창이나 Splitter 크기가 변경될 때 이미지 비율을 맞춰서 다시 그려줌
         if hasattr(self, "current_pixmap") and not self.current_pixmap.isNull():
             scaled_pixmap = self.current_pixmap.scaled(
                 self.image_viewer.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation

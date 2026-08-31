@@ -50,6 +50,29 @@ kpopping.com의 고화질 K-POP 아이돌 사진(KPics)을 편하게 감상하�
 터미널에 아래 명령어를 복사하여 붙여넣고 엔터를 칩니다.
 
 ```bash
-git clone [https://github.com/본인계정명/kpopping-downloader.git](https://github.com/본인계정명/kpopping-downloader.git)
+git clone https://github.com/본인계정명/kpopping-downloader.git
 cd kpopping-downloader
+```
+
+### 4단계: 프로그램 실행하기
+
+프로젝트 폴더에서 다음 명령어를 실행하면 `uv`가 자동으로 가상환경을 생성하고 필요한 패키지를 설치한 뒤 프로그램을 실행합니다.
+
+```bash
+# 의존성 설치 및 실행을 한 번에
+uv run python main.py
+```
+
+> **💡 팁**: `uv run`은 별도로 가상환경을 활성화하지 않아도, 실행 시점에 올바른 Python 환경을 자동으로 찾아 실행합니다.
+
+만약 `uv` 명령어를 찾을 수 없다는 오류가 나온다면, 터미널을 닫았다가 다시 열거나 아래 명령어로 `uv`를 설치해주세요.
+
+**Windows (PowerShell)**
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+**Mac / Linux**
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```

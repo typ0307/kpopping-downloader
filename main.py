@@ -3,9 +3,8 @@ import random
 import re
 import sys
 import time
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
-import cloudscraper
 from bs4 import BeautifulSoup
 from PySide6.QtCore import QSize, Qt, QThread, Signal
 from PySide6.QtGui import QIcon, QImage, QPixmap
@@ -25,15 +24,13 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from curl_cffi import requests as curl_requests
 
-# 봇 탐지 우회를 위한 크롬 브라우저 위장 스크래퍼
-scraper = cloudscraper.create_scraper(
-    browser={"browser": "chrome", "platform": "windows", "desktop": True}
-)
+# 봇 탐지 우회를 위한 크롬 브라우저 위장 세션 (실제 크롬의 TLS/HTTP2 지문 그대로 사용)
+session = curl_requests.Session(impersonate="chrome")
 
 HEADERS = {
     "Referer": "https://kpopping.com/",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
 }
 
 
@@ -49,7 +46,7 @@ class FetchThread(QThread):
 
     def run(self):
         try:
-            res = scraper.get(self.url, headers=HEADERS, timeout=10)
+            res = session.get(self.url, headers=HEADERS, timeout=10)
             res.raise_for_status()
             soup = BeautifulSoup(res.text, "html.parser")
 
@@ -102,12 +99,12 @@ class ThumbnailLoaderThread(QThread):
                 break
             try:
                 time.sleep(random.uniform(0.1, 0.3))
-                encoded_url = url.replace(":", "%3A").replace("/", "%2F")
+                encoded_url = quote(url, safe="")
                 thumb_url = (
-                    f"https://kpopping.com/_next/image?url={encoded_url}&w=256&q=75"
+                    f"https://kpopping.com/api/kpics-image?url={encoded_url}&size=display-small"
                 )
 
-                res = scraper.get(thumb_url, headers=HEADERS, timeout=5)
+                res = session.get(thumb_url, headers=HEADERS, timeout=5)
                 if res.status_code == 200:
                     img = QImage()
                     img.loadFromData(res.content)
@@ -144,7 +141,7 @@ class DownloadThread(QThread):
 
                 time.sleep(random.uniform(0.5, 1.5))
 
-                res = scraper.get(url, headers=HEADERS, timeout=15)
+                res = session.get(url, headers=HEADERS, timeout=15)
                 res.raise_for_status()
 
                 original_filename = url.split("/")[-1].split("?")[0]
@@ -294,7 +291,7 @@ class MainWindow(QMainWindow):
     def load_main_image(self, url):
         self.current_image_url = url
         try:
-            res = scraper.get(url, headers=HEADERS, timeout=5)
+            res = session.get(url, headers=HEADERS, timeout=5)
             img = QImage()
             img.loadFromData(res.content)
             self.current_pixmap = QPixmap.fromImage(img)
@@ -323,7 +320,7 @@ class MainWindow(QMainWindow):
             original_filename = self.current_image_url.split("/")[-1].split("?")[0]
             file_path = os.path.join(save_dir, original_filename)
 
-            res = scraper.get(self.current_image_url, headers=HEADERS, timeout=10)
+            res = session.get(self.current_image_url, headers=HEADERS, timeout=10)
             res.raise_for_status()
 
             with open(file_path, "wb") as f:
